@@ -142,6 +142,12 @@ def clip_by_value(x, tensor_min, tensor_max):
     return clipped
 
 
+def self_certainty_from_logits(logits: torch.Tensor):
+    """Calculate self-certainty from logits."""
+    self_certainty = torch.logsumexp(logits, dim=-1) - logits.mean(dim=-1)
+    return self_certainty
+
+
 def entropy_from_logits(logits: torch.Tensor):
     """Calculate entropy from logits."""
     pd = torch.nn.functional.softmax(logits, dim=-1)

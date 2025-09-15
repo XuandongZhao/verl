@@ -85,10 +85,19 @@ class DataParallelPPOActor(BasePPOActor):
             if self.config.get("use_torch_compile", True)  #  use torch compile by default
             else entropy_from_logits
         )
+
+        self_certainty_from_logits = verl_F.self_certainty_from_logits
+
+        self.compute_self_certainty_from_logits = (
+            torch.compile(self_certainty_from_logits, dynamic=True)
+            if self.config.get("use_torch_compile", True)  #  use torch compile by default
+            else self_certainty_from_logits
+        )
+
         self.device_name = get_device_name()
 
     def _forward_micro_batch(
-        self, micro_batch, temperature, calculate_entropy=False
+        self, micro_batch, temperature, calculate_entropy=False, calculate_self_certainty=False
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -113,6 +122,7 @@ class DataParallelPPOActor(BasePPOActor):
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
             entropy = None
+            self_certainty = None
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 3, seqlen) -> (3, bsz, seqlen)
 
@@ -186,14 +196,14 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
                     entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
-
+                    self_certainty_rmpad = output.self_certainty.squeeze(0)  # (total_nnz,)
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
                     logits_rmpad.div_(temperature)
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
-                    if calculate_entropy:
+                    if calculate_entropy or calculate_self_certainty:
                         inplace_backward = False
                     log_probs = logprobs_from_logits(
                         logits=logits_rmpad,
@@ -209,6 +219,10 @@ class DataParallelPPOActor(BasePPOActor):
                             entropy_rmpad = torch.utils.checkpoint.checkpoint(
                                 self.compute_entropy_from_logits, logits_rmpad
                             )
+
+                    # compute self_certainty
+                    if calculate_self_certainty:
+                        self_certainty_rmpad = self.compute_self_certainty_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
 
                 # gather log_prob if sp > 1
                 if self.use_ulysses_sp:
@@ -226,10 +240,24 @@ class DataParallelPPOActor(BasePPOActor):
                             unpad_dim=0,
                             padding_size=pad_size,
                         )
+                    if calculate_self_certainty:
+                        self_certainty_rmpad = gather_outputs_and_unpad(
+                            self_certainty_rmpad,
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                        )
                 # pad back to (bsz, seqlen)
                 if calculate_entropy:
                     full_entropy = pad_input(
                         hidden_states=entropy_rmpad.unsqueeze(-1),
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                if calculate_self_certainty:
+                    full_self_certainty = pad_input(
+                        hidden_states=self_certainty_rmpad.unsqueeze(-1),
                         indices=indices,
                         batch=batch_size,
                         seqlen=seqlen,
@@ -244,6 +272,8 @@ class DataParallelPPOActor(BasePPOActor):
                 # only return response part:
                 if calculate_entropy:
                     entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
+                if calculate_self_certainty:
+                    self_certainty = full_self_certainty.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
 
             else:  # not using rmpad and no ulysses sp
@@ -264,7 +294,7 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
                     entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
-
+                    self_certainty = output.self_certainty[:, -response_length - 1 : -1]  # (bsz, response_length)
                 else:
                     logits = output.logits
 
@@ -276,8 +306,10 @@ class DataParallelPPOActor(BasePPOActor):
                             entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
-
-            return entropy, log_probs
+                    if calculate_self_certainty:
+                        self_certainty = verl_F.self_certainty_from_logits(logits)
+                        
+            return entropy, log_probs, self_certainty
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -298,7 +330,7 @@ class DataParallelPPOActor(BasePPOActor):
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
-    def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
+    def compute_log_prob(self, data: DataProto, calculate_entropy=False, calculate_self_certainty=False) -> torch.Tensor:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
         Args:
@@ -336,28 +368,36 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
+        self_certainty_lst = []
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                entropy, log_probs = self._forward_micro_batch(
-                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                entropy, log_probs, self_certainty = self._forward_micro_batch(
+                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy, calculate_self_certainty=calculate_self_certainty
                 )
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
+            if calculate_self_certainty:
+                self_certainty_lst.append(self_certainty)
 
         log_probs = torch.concat(log_probs_lst, dim=0)
         entropys = None
+        self_certaintys = None
         if calculate_entropy:
             entropys = torch.concat(entropy_lst, dim=0)
+        if calculate_self_certainty:
+            self_certaintys = torch.concat(self_certainty_lst, dim=0)
 
         if use_dynamic_bsz:
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
             if calculate_entropy:
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
+            if calculate_self_certainty:
+                self_certaintys = restore_dynamic_batch(self_certaintys, batch_idx_list)
 
-        return log_probs, entropys
+        return log_probs, entropys, self_certaintys
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
@@ -431,7 +471,7 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(
+                    entropy, log_prob, _ = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
 

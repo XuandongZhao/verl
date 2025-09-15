@@ -253,6 +253,29 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator == AdvantageEstimator.INTUITOR:
+        # Get the token-level self-certainty and response mask
+        self_certaintys = data.batch["self_certaintys"]          # shape: [B, T]
+        response_mask = data.batch["response_mask"].float()      # shape: [B, T], convert to float for correct division
+
+        # Compute sentence-wise mean self-certainty
+        # Multiply by response_mask to zero out non-response tokens
+        masked_certainty = self_certaintys * response_mask       # [B, T]
+        sum_certainty = masked_certainty.sum(dim=-1)             # [B]
+        count = response_mask.sum(dim=-1) + 1e-8                 # avoid divide-by-zero; [B]
+        sentence_wise_mean = sum_certainty / count               # [B]
+        # Broadcast sentence-level scores back to token-level shape for compatibility
+        token_level_rewards = sentence_wise_mean.unsqueeze(1).expand_as(self_certaintys)  # [B, T]
+
+        # Use this in the GRPO advantage computation
+        advantages, returns = core_algos.compute_grpo_outcome_advantage(
+            token_level_rewards=token_level_rewards,
+            response_mask=response_mask,
+            index=data.non_tensor_batch["uid"],
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
