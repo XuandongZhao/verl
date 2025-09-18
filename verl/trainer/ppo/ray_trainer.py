@@ -267,6 +267,15 @@ def compute_advantage(
         # Broadcast sentence-level scores back to token-level shape for compatibility
         token_level_rewards = sentence_wise_mean.unsqueeze(1).expand_as(self_certaintys)  # [B, T]
 
+        print('-------------------------------- This is Intuitor --------------------------------')
+        print(f"data.batch['self_certaintys'].shape: {data.batch['self_certaintys'].shape}")
+        print(f"data.batch['self_certaintys']: {data.batch['self_certaintys']}")
+        print(f"data.batch['response_mask']: {data.batch['response_mask']}")
+        print(f"sentence_wise_mean: {sentence_wise_mean}")
+        print(f"sentence_wise_mean.shape: {sentence_wise_mean.shape}")
+        print(f"token_level_rewards: {token_level_rewards}")
+        print('-------------------------------- End of Intuitor --------------------------------')
+
         # Use this in the GRPO advantage computation
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=token_level_rewards,
@@ -276,6 +285,147 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator == AdvantageEstimator.INTUITOR_ENTROPY:
+        # Get the token-level self-certainty and response mask
+        self_certaintys = -data.batch["entropys"]          # shape: [B, T]
+        response_mask = data.batch["response_mask"].float()      # shape: [B, T], convert to float for correct division
+
+        # Compute sentence-wise mean self-certainty
+        # Multiply by response_mask to zero out non-response tokens
+        masked_certainty = self_certaintys * response_mask       # [B, T]
+        sum_certainty = masked_certainty.sum(dim=-1)             # [B]
+        count = response_mask.sum(dim=-1) + 1e-8                 # avoid divide-by-zero; [B]
+        sentence_wise_mean = sum_certainty / count               # [B]
+        # Broadcast sentence-level scores back to token-level shape for compatibility
+        token_level_rewards = sentence_wise_mean.unsqueeze(1).expand_as(self_certaintys)  # [B, T]
+
+        print('-------------------------------- This is Intuitor Entropy --------------------------------')
+        print(f"data.batch['entropys'].shape: {data.batch['entropys'].shape}")
+        print(f"data.batch['entropys']: {data.batch['entropys']}")
+        print(f"data.batch['response_mask']: {data.batch['response_mask']}")
+        print(f"sentence_wise_mean: {sentence_wise_mean}")
+        print(f"sentence_wise_mean.shape: {sentence_wise_mean.shape}")
+        print(f"token_level_rewards: {token_level_rewards}")
+        print('-------------------------------- End of Intuitor Entropy --------------------------------')
+
+        # Use this in the GRPO advantage computation
+        advantages, returns = core_algos.compute_grpo_outcome_advantage(
+            token_level_rewards=token_level_rewards,
+            response_mask=response_mask,
+            index=data.non_tensor_batch["uid"],
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
+
+       
+    elif adv_estimator == AdvantageEstimator.INTUITOR_SELECTIVE:
+        # Get the token-level self-certainty and response mask
+        self_certaintys = data.batch["self_certaintys"]          # shape: [B, T]
+        response_mask = data.batch["response_mask"].float()      # shape: [B, T], convert to float for correct division
+
+        # Detect sequences that reached maximum length
+        # A sequence reached max length if the last token in response_mask is 1
+        reached_max_length = response_mask[:, -1] == 1  # [B]
+
+        # Compute sentence-wise mean self-certainty
+        # Multiply by response_mask to zero out non-response tokens
+        masked_certainty = self_certaintys * response_mask       # [B, T]
+        sum_certainty = masked_certainty.sum(dim=-1)             # [B]
+        count = response_mask.sum(dim=-1) + 1e-8                 # avoid divide-by-zero; [B]
+        sentence_wise_mean = sum_certainty / count               # [B]
+
+        # Select sequences with lower-than-batch-mean self-certainty
+        batch_mean_certainty = sentence_wise_mean.mean()         # scalar
+        selected_seq_mask = sentence_wise_mean < batch_mean_certainty  # [B] - True for selected sequences
+        # Randomly select 10% of the non-selected sequences (high certainty) to include
+        non_selected_seq_mask = ~selected_seq_mask
+        num_non_selected = non_selected_seq_mask.sum().item()
+        
+        if num_non_selected > 0:
+            # Calculate how many to randomly include (10% of non-selected)
+            num_to_include = max(1, int(0.1 * num_non_selected))
+            
+            # Get indices of non-selected sequences
+            non_selected_indices = torch.where(non_selected_seq_mask)[0]
+            
+            # Randomly select indices to include
+            perm = torch.randperm(len(non_selected_indices))
+            random_indices_to_include = non_selected_indices[perm[:num_to_include]]
+            
+            # Update the selection mask to include these random sequences
+            selected_seq_mask[random_indices_to_include] = True
+            
+            print(f"Randomly including {num_to_include} high-certainty sequences")
+        
+        # Get ground truth rewards (0 or 1) from the rule-based reward
+        gt_token_level_rewards = data.batch["token_level_rewards"]  # [B, T] (rule-based ground truth)
+        
+        # Give 0 rewards to sequences that reached maximum length
+        # This penalizes overly long responses
+        gt_token_level_rewards[reached_max_length] = 0
+        
+        # Debug information before selection
+        print('-------------------------------- This is Intuitor Selective --------------------------------')
+        print(f"Total batch size: {len(selected_seq_mask)}")
+        print(f"Batch mean self-certainty: {batch_mean_certainty:.4f}")
+        print(f"Self-certainty range: [{sentence_wise_mean.min().item():.4f}, {sentence_wise_mean.max().item():.4f}]")
+        print(f"Number of sequences selected (low certainty): {selected_seq_mask.sum().item()}")
+        print(f"Number of sequences excluded (high certainty): {(~selected_seq_mask).sum().item()}")
+        print(f"Number of sequences that reached max length (given 0 rewards): {reached_max_length.sum().item()}")
+        
+        # Show rewards distribution for selected vs non-selected
+        selected_rewards = gt_token_level_rewards.sum(dim=-1)[selected_seq_mask]
+        if selected_seq_mask.sum() > 0:
+            print(f"Selected sequences - Correct: {(selected_rewards > 0).sum().item()}, Wrong: {(selected_rewards == 0).sum().item()}")
+        
+        non_selected_rewards = gt_token_level_rewards.sum(dim=-1)[~selected_seq_mask]
+        if (~selected_seq_mask).sum() > 0:
+            print(f"Excluded sequences - Correct: {(non_selected_rewards > 0).sum().item()}, Wrong: {(non_selected_rewards == 0).sum().item()}")
+        
+        # Store original selection info for later use
+        data.non_tensor_batch["intuitor_selected_mask"] = selected_seq_mask.cpu().numpy()
+        data.non_tensor_batch["intuitor_certainty_scores"] = sentence_wise_mean.cpu().numpy()
+        data.non_tensor_batch["intuitor_reached_max_length"] = reached_max_length.cpu().numpy()
+        
+        # IMPORTANT: Filter the data to only include selected sequences
+        if selected_seq_mask.sum() == 0:
+            print("WARNING: No sequences selected! Using all sequences to avoid empty batch.")
+            selected_seq_mask = torch.ones_like(selected_seq_mask, dtype=torch.bool)
+        
+        # Create filtered versions of the data for GRPO computation
+        filtered_token_rewards = gt_token_level_rewards[selected_seq_mask]
+        filtered_response_mask = response_mask[selected_seq_mask]
+        filtered_uids = data.non_tensor_batch["uid"][selected_seq_mask.cpu().numpy()]
+        
+        print(f"Filtered batch size for GRPO: {len(filtered_token_rewards)}")
+        print('-------------------------------- End of Intuitor Selective --------------------------------')
+
+        # Compute advantages only for selected sequences
+        advantages_filtered, returns_filtered = core_algos.compute_grpo_outcome_advantage(
+            token_level_rewards=filtered_token_rewards,
+            response_mask=filtered_response_mask,
+            index=filtered_uids,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        )
+        
+        # Now we need to put the advantages back into the full batch shape
+        # Initialize with zeros (non-selected sequences will have zero advantages)
+        advantages = torch.zeros_like(gt_token_level_rewards)
+        returns = torch.zeros_like(gt_token_level_rewards)
+        
+        # Fill in the advantages for selected sequences
+        advantages[selected_seq_mask] = advantages_filtered
+        returns[selected_seq_mask] = returns_filtered
+        
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
+        
+        # CRITICAL: Modify response_mask to exclude non-selected sequences from loss computation
+        # This ensures that during actor update, only selected sequences contribute to gradients
+        original_response_mask = data.batch["response_mask"].clone()
+        data.batch["response_mask"] = original_response_mask * selected_seq_mask.unsqueeze(1).float()
+        data.non_tensor_batch["original_response_mask"] = original_response_mask.cpu().numpy()
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -1072,6 +1222,9 @@ class RayPPOTrainer:
                         old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
                         metrics.update(old_log_prob_metrics)
                         old_log_prob.batch.pop("entropys")
+                        
+                        # To add an entry to batch, you can use:
+                        batch.batch["entropys"] = entropys
                         batch = batch.union(old_log_prob)
 
                         if "rollout_log_probs" in batch.batch.keys():

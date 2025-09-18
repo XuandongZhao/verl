@@ -103,6 +103,8 @@ class AdvantageEstimator(str, Enum):
     GRPO_PASSK = "grpo_passk"
     GPG = "gpg"
     INTUITOR = "intuitor"
+    INTUITOR_SELECTIVE = "intuitor_selective"
+    INTUITOR_ENTROPY = "intuitor_entropy"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
